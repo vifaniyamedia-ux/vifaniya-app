@@ -256,19 +256,44 @@ async function ensureBook(name) {
   spinner();
   const r = await loadBook(name);
   Object.assign(state, { name, book: r.book, sha: r.sha, filter: "", scroll: 0 });
+  const meta = store.get("bookMeta", {});
+  meta[name] = { title: r.book.title, count: r.book.songs.length };
+  store.set("bookMeta", meta);
+  hideUpdate();
 }
+
+/* "new changes" banner: checked when the app comes back to the screen and every minute */
+function hideUpdate() { $("#update").classList.add("hidden"); }
+async function checkUpdates() {
+  if (!state.name || !state.sha || editing || document.hidden || !cfg().token) return;
+  try {
+    const dir = await gh("/contents/songbooks");
+    const f = dir.find((x) => x.name === state.name + ".json");
+    if (f && f.sha !== state.sha) $("#update").classList.remove("hidden");
+  } catch (_) {}
+}
+$("#updateBtn").onclick = async () => {
+  hideUpdate();
+  const keep = state.filter;
+  state.book = null;
+  await route();
+  if (keep && state.book) { state.filter = keep; }
+  toast("Пісні оновлено", "ok");
+};
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkUpdates(); });
+setInterval(checkUpdates, 60000);
 
 /* ---------------------------------------------------------------- screens */
 
 async function screenBooks() {
   setTab("songs");
-  setBar("Пісні", cfg().repo.split("/")[1] || "");
+  setBar("Пісенники");
   spinner();
   let books;
   try { books = await listBooks(); } catch (e) { return errorView(e, screenBooks); }
   if (books.length === 1) { location.replace("#/b/" + encodeURIComponent(books[0].name)); return; }
   view.innerHTML = books.length
-    ? `<div class="section-title">Пісенники</div><ul class="list">${books.map((b) => `<li data-b="${esc(b.name)}"><span class="plan-icon">${icons.book}</span><span class="txt"><div class="t">${esc(b.name)}</div></span>${icons.chev}</li>`).join("")}</ul>`
+    ? `<div class="section-title">Пісенники</div><ul class="list">${books.map((b) => { const m = store.get("bookMeta", {})[b.name] || {}; return `<li data-b="${esc(b.name)}"><span class="plan-icon">${icons.book}</span><span class="txt"><div class="t">${esc(m.title || b.name)}</div>${m.count ? `<div class="f">${m.count} пісень</div>` : ""}</span>${icons.chev}</li>`; }).join("")}</ul>`
     : '<div class="empty"><p>У сховищі ще немає пісенників.</p></div>';
   view.querySelectorAll("li[data-b]").forEach((li) => (li.onclick = () => (location.hash = "#/b/" + encodeURIComponent(li.dataset.b))));
 }
@@ -282,7 +307,7 @@ async function screenSongs(name) {
     <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="q" type="search" placeholder="Назва, рядок пісні або номер" value="${esc(state.filter)}" autocomplete="off"></div>
     <div class="count" id="count"></div>
     <ul class="list" id="songs"></ul>
-    ${cfg().readOnly ? "" : `<button class="fab" id="fab" aria-label="Нова пісня">${icons.plus}</button>`}`;
+    ${cfg().readOnly ? "" : `<button class="fab" id="fab" aria-label="Нова пісня">${icons.plus}Пісня</button>`}`;
   const render = () => {
     const q = norm(state.filter.trim());
     let items = state.book.songs.map((s, i) => ({ s, n: i + 1 }));
@@ -314,7 +339,7 @@ function screenSong(name, id) {
   document.documentElement.style.setProperty("--lyrics", size + "px");
   setBar("№ " + (i + 1), state.book.title, {
     back: "#/b/" + encodeURIComponent(name),
-    actions: `<button class="bar-btn" id="zm" aria-label="Менший шрифт">${icons.aminus}</button><button class="bar-btn" id="zp" aria-label="Більший шрифт">${icons.aplus}</button>${cfg().readOnly ? "" : `<button class="bar-btn" id="ed" aria-label="Редагувати">${icons.edit}</button>`}`,
+    actions: `<button class="bar-btn" id="zm" aria-label="Менший шрифт">${icons.aminus}</button><button class="bar-btn" id="zp" aria-label="Більший шрифт">${icons.aplus}</button>${cfg().readOnly ? "" : `<button class="bar-btn accent" id="ed" aria-label="Редагувати">${icons.edit}</button>`}`,
   });
   const authors = [s.wordsAuthor && "сл. " + s.wordsAuthor, s.musicAuthor && "муз. " + s.musicAuthor].filter(Boolean).join(" · ");
   view.innerHTML = `<article class="song"><h1>${esc(s.title)}</h1><div class="meta">${esc([s.altTitle, authors].filter(Boolean).join(" · "))}</div>
