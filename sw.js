@@ -1,5 +1,5 @@
 // Offline support: the app itself is cached; songs are cached by app.js.
-const VERSION = "vs-app-20261126134825";
+const VERSION = "vs-app-20261126141223";
 const FILES = ["./", "index.html", "app.css", "app.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {

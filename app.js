@@ -460,40 +460,65 @@ async function screenPlan() {
   setTab("plan");
   setBar("План служіння", "з комп'ютерів церкви");
   spinner();
-  let xml;
+  let xml, from = "";
   try {
     xml = await gh("/contents/plan/PlanDef.xml", { raw: true });
     await cachePut("plan", xml); setOffline(false);
+    try {
+      const c = (await gh("/commits?path=plan/PlanDef.xml&per_page=1"))[0];
+      if (c) {
+        const host = (c.commit.message.split(":")[0] || "").trim();
+        const d = new Date(c.commit.author.date);
+        from = `${host ? "з комп'ютера «" + host + "» · " : ""}${d.toLocaleDateString("uk-UA", { day: "numeric", month: "long" })} о ${d.toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" })}`;
+        store.set("planFrom", from);
+      }
+    } catch (_) {}
   } catch (e) {
-    if (e.status === 404) { view.innerHTML = '<div class="empty"><p>План ще не синхронізовано.</p></div>'; return; }
-    if (isNetErr(e) && (xml = await cacheGet("plan"))) setOffline(true);
+    if (e.status === 404) { view.innerHTML = '<div class="empty"><p>План ще не синхронізовано.</p><p class="hint">Він з\'явиться, коли на комп\'ютері церкви збережуть план у VisioBible.</p></div>'; return; }
+    if (isNetErr(e) && (xml = await cacheGet("plan"))) { setOffline(true); from = store.get("planFrom", ""); }
     else return errorView(e, screenPlan);
   }
+  setBar("План служіння", from || "з комп'ютерів церкви");
   const doc = new DOMParser().parseFromString(xml, "application/xml");
   const part = (name) => [...doc.querySelectorAll(`Journal[Name="${name}"] > Item`)];
-  const sec = (title, icon, items, fn) => items.length ? `<div class="section-title">${title}</div><div class="plan-box">${items.map((it) => { const [t, f] = fn(it); return `<div class="plan-item"><span class="plan-icon">${icon}</span><div><div class="t">${esc(t)}</div>${f ? `<div class="f">${esc(f)}</div>` : ""}</div></div>`; }).join("")}</div>` : "";
   const songs = part("Songs"), bible = part("Bible"), texts = part("Text");
-  view.innerHTML = (sec("Пісні", icons.music, songs, (it) => [it.getAttribute("SongName"), [it.getAttribute("TextModuleName"), it.getAttribute("SongChunkName")].filter(Boolean).join(" · ")])
-    + sec("Біблія", icons.book, bible, (it) => [it.getAttribute("Reference") + " " + (+it.getAttribute("Chapter") + 1) + ":" + (+it.getAttribute("Verse") + 1), it.getAttribute("Quote")])
-    + sec("Тексти", icons.text, texts, (it) => [it.getAttribute("Reference").replace(/:\s*$/, ""), (it.getAttribute("Quote") || "").replace(/ \| /g, "\n")]))
-    || '<div class="empty"><p>План порожній.</p></div>';
-  view.querySelectorAll(".plan-item").forEach((el, k) => {
-    if (k >= songs.length) return;
-    const name = songs[k].getAttribute("SongName");
-    el.onclick = () => openPlanSong(name);
-  });
+  const preview = (t) => (t || "").replace(/\r/g, "").split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 2).join(" / ");
+  const item = (icon, t, f, attrs = "") => `<div class="plan-item" ${attrs}><span class="plan-icon">${icon}</span><div style="flex:1;min-width:0"><div class="t">${esc(t)}</div>${f ? `<div class="f">${esc(f)}</div>` : ""}</div>${attrs ? icons.chev : ""}</div>`;
+  let html = "";
+  if (songs.length) html += `<div class="section-title">Пісні</div><div class="plan-box">${songs.map((it, k) => item(icons.music, (it.getAttribute("SongName") || "").replace(/[,.;:]+$/, ""), [it.getAttribute("TextModuleName"), preview(it.getAttribute("SongChunkText"))].filter(Boolean).join(" · "), `data-song="${k}"`)).join("")}</div>`;
+  if (bible.length) html += `<div class="section-title">Біблія</div><div class="plan-box">${bible.map((it) => item(icons.book, (it.getAttribute("Reference") || "") + " " + (+it.getAttribute("Chapter") + 1) + ":" + (+it.getAttribute("Verse") + 1) + (it.getAttribute("ModuleShortName") ? " · " + it.getAttribute("ModuleShortName") : ""), it.getAttribute("Quote"))).join("")}</div>`;
+  if (texts.length) html += `<div class="section-title">Тексти</div><div class="plan-box">${texts.map((it) => item(icons.text, (it.getAttribute("Reference") || "").replace(/:\s*$/, ""), (it.getAttribute("Quote") || "").replace(/ \| /g, "\n"))).join("")}</div>`;
+  view.innerHTML = html
+    ? html + '<p class="hint" style="margin:4px 16px 20px">План береться з комп\'ютера, де його востаннє змінили у VisioBible. VisioBible зберігає пісні, місця з Біблії й тексти трьома окремими списками.</p>'
+    : '<div class="empty"><p>План порожній.</p></div>';
+  planSongs = songs;
+  view.querySelectorAll("[data-song]").forEach((el) => (el.onclick = () => (location.hash = "#/plan/s/" + el.dataset.song)));
 }
+let planSongs = [];
 
-async function openPlanSong(title) {
-  const books = store.get("books", []);
-  for (const b of books) {
+async function openPlanSong(it) {
+  const title = it.getAttribute("SongName") || "";
+  const mod = norm(it.getAttribute("TextModuleName") || "").trim();
+  const t = norm(title).replace(/[,.;:!?]+$/, "").trim();
+  const find = () => state.book.songs.find((x) => norm(x.title).trim().replace(/[,.;:!?]+$/, "").startsWith(t));
+  let similar = null;
+  for (const b of store.get("books", [])) {
     try { await ensureBook(b.name); } catch (_) { continue; }
-    const t = norm(title).trim();
-    const s = state.book.songs.find((x) => norm(x.title).trim().startsWith(t));
-    if (s) { location.hash = `#/b/${encodeURIComponent(b.name)}/s/${s.id}`; return; }
+    const same = norm(state.book.title).trim() === mod || norm(state.book.shortName).trim() === mod;
+    const s = find();
+    if (s && same) { location.replace(`#/b/${encodeURIComponent(b.name)}/s/${s.id}`); return; }
+    if (s && !similar) similar = { name: b.name, id: s.id, book: state.book.title };
   }
-  toast("Цієї пісні немає в спільних пісенниках");
-  screenPlan();
+  // the songbook of this plan song is not shared with the phone (e.g. "П 2000"):
+  // show the part saved in the plan
+  setTab("plan");
+  setBar(title.replace(/[,.;:]+$/, ""), it.getAttribute("TextModuleName") || "", { back: "#/plan" });
+  view.innerHTML = `<article class="song"><h1>${esc(title.replace(/[,.;:]+$/, ""))}</h1><div class="meta">${esc(it.getAttribute("TextModuleName") || "")} · у плані збережено лише цю частину</div>
+    <div class="part"><div class="part-name">${esc(it.getAttribute("SongChunkName") || "")}</div><div class="part-text">${esc(lines(it.getAttribute("SongChunkText") || ""))}</div></div>
+    <p class="hint">Повний текст є на комп'ютерах церкви: пісенник «${esc(it.getAttribute("TextModuleName") || "")}» не синхронізується з телефоном.</p>
+    ${similar ? `<button class="btn full" id="sim">Схожа пісня є в «${esc(similar.book)}» — відкрити</button>` : ""}</article>`;
+  if (similar) $("#sim").onclick = () => (location.hash = `#/b/${encodeURIComponent(similar.name)}/s/${similar.id}`);
+  scrollTo(0, 0);
 }
 
 function screenSettings() {
@@ -549,6 +574,10 @@ async function route() {
   try {
     if (h === "/settings") return screenSettings();
     if (h === "/plan") return await screenPlan();
+    if ((m = h.match(/^\/plan\/s\/(\d+)$/))) {
+      if (!planSongs[+m[1]]) await screenPlan();
+      return planSongs[+m[1]] ? await openPlanSong(planSongs[+m[1]]) : (location.hash = "#/plan");
+    }
     if ((m = h.match(/^\/b\/([^/]+)\/new$/))) { const n = decodeURIComponent(m[1]); await ensureBook(n); return screenEdit(n, null); }
     if ((m = h.match(/^\/b\/([^/]+)\/s\/([^/]+)\/edit$/))) { const n = decodeURIComponent(m[1]); await ensureBook(n); return screenEdit(n, m[2]); }
     if ((m = h.match(/^\/b\/([^/]+)\/s\/([^/]+)$/))) { const n = decodeURIComponent(m[1]); await ensureBook(n); return screenSong(n, m[2]); }
