@@ -7,7 +7,10 @@
 const DEFAULT_REPO = "vifaniyamedia-ux/vifaniya-storage";
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const view = $("#view");
+const root = $("#view");
+let view = root; // where the current screen draws (a pane on wide screens)
+const wideMQ = matchMedia("(min-width: 1024px)");
+const isWide = () => wideMQ.matches;
 
 /* ---------------------------------------------------------------- settings */
 
@@ -221,7 +224,8 @@ function setBar(title, sub = "", { back = null, actions = "" } = {}) {
   b.onclick = back ? () => (typeof back === "string" ? (location.hash = back) : back()) : null;
   $("#barActions").innerHTML = actions;
 }
-function setTab(t) { document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === t)); }
+function setTab(t) { document.querySelectorAll(".tabs a, .side-nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === t)); }
+function toTop() { view.scrollTop = 0; if (!isWide()) scrollTo(0, 0); }
 const spinner = () => { view.innerHTML = '<div class="spinner"></div>'; };
 function errorView(e, retry) {
   view.innerHTML = `<div class="empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg><p>${esc(e.message)}</p>${retry ? '<button class="btn" id="retry">Спробувати ще раз</button>' : ""}${e.status === 401 ? '<p><a href="#/settings">Відкрити налаштування</a></p>' : ""}</div>`;
@@ -248,14 +252,28 @@ function firstLine(s) { for (const c of s.chunks || []) { const l = (c.text || "
 
 /* ---------------------------------------------------------------- state */
 
-const state = { name: "", book: null, sha: "", filter: "", scroll: 0 };
+const state = { name: "", book: null, sha: "", filter: "", scroll: 0, all: false };
+const books = {}; // name -> {book, sha}: every songbook loaded so far
+function dropBook(name) { delete books[name]; if (!name || state.name === name) { state.book = null; } if (!name) for (const k in books) delete books[k]; }
 let editing = null; // {song, base, isNew, dirty}
 
+async function getBook(name) {
+  if (!books[name]) {
+    const r = await loadBook(name);
+    books[name] = { book: r.book, sha: r.sha };
+    const meta = store.get("bookMeta", {});
+    meta[name] = { title: r.book.title, count: r.book.songs.length };
+    store.set("bookMeta", meta);
+    renderSide();
+  }
+  return books[name];
+}
 async function ensureBook(name) {
   if (state.name === name && state.book) return;
-  spinner();
-  const r = await loadBook(name);
-  Object.assign(state, { name, book: r.book, sha: r.sha, filter: "", scroll: 0 });
+  if (!books[name]) spinner();
+  const keep = state.name === name || state.all ? state.filter : "";
+  const r = await getBook(name);
+  Object.assign(state, { name, book: r.book, sha: r.sha, filter: keep, scroll: 0 });
   const meta = store.get("bookMeta", {});
   meta[name] = { title: r.book.title, count: r.book.songs.length };
   store.set("bookMeta", meta);
@@ -274,14 +292,42 @@ async function checkUpdates() {
 }
 $("#updateBtn").onclick = async () => {
   hideUpdate();
-  const keep = state.filter;
-  state.book = null;
+  dropBook(state.name);
+  delete root.dataset.book; // redraw the list too
   await route();
-  if (keep && state.book) { state.filter = keep; }
   toast("Пісні оновлено", "ok");
 };
 document.addEventListener("visibilitychange", () => { if (!document.hidden) checkUpdates(); });
 setInterval(checkUpdates, 60000);
+
+/* ---------------------------------------------------------------- search */
+
+function matchSong(s, n, q) {
+  return String(n) === q || norm(s.title).includes(q) || norm(s.altTitle).includes(q) || (s.chunks || []).some((c) => norm(c.text).includes(q));
+}
+// searchAll looks through every songbook (loading the ones not opened yet).
+async function searchAll(q) {
+  const out = [];
+  for (const b of store.get("books", [])) {
+    let r;
+    try { r = await getBook(b.name); } catch (_) { continue; }
+    r.book.songs.forEach((s, i) => { if (matchSong(s, i + 1, q)) out.push({ name: b.name, title: r.book.title, s, n: i + 1 }); });
+  }
+  return out;
+}
+function songRow(name, s, n, bookTitle, active) {
+  return `<li data-id="${esc(s.id)}" data-b="${esc(name)}" class="${active ? "active" : ""}"><span class="n">${n}</span><span class="txt"><div class="t">${esc(s.title.trim() || "без назви")}</div><div class="f">${bookTitle ? `<b>${esc(bookTitle)}</b> · ` : ""}${esc(firstLine(s))}</div></span></li>`;
+}
+
+/* ---------------------------------------------------------------- sidebar (wide screens) */
+
+function renderSide() {
+  const box = $("#sideBooks");
+  if (!box) return;
+  const meta = store.get("bookMeta", {});
+  const list = store.get("books", []);
+  box.innerHTML = list.map((b) => `<a href="#/b/${encodeURIComponent(b.name)}" data-book="${esc(b.name)}" class="${state.name === b.name && location.hash.startsWith("#/b/") ? "active" : ""}">${icons.book}<span>${esc((meta[b.name] || {}).title || b.name)}</span><small>${(meta[b.name] || {}).count || ""}</small></a>`).join("");
+}
 
 /* ---------------------------------------------------------------- screens */
 
@@ -289,45 +335,81 @@ async function screenBooks() {
   setTab("songs");
   setBar("Пісенники");
   spinner();
-  let books;
-  try { books = await listBooks(); } catch (e) { return errorView(e, screenBooks); }
-  if (books.length === 1) { location.replace("#/b/" + encodeURIComponent(books[0].name)); return; }
-  view.innerHTML = books.length
-    ? `<div class="section-title">Пісенники</div><ul class="list">${books.map((b) => { const m = store.get("bookMeta", {})[b.name] || {}; return `<li data-b="${esc(b.name)}"><span class="plan-icon">${icons.book}</span><span class="txt"><div class="t">${esc(m.title || b.name)}</div>${m.count ? `<div class="f">${m.count} пісень</div>` : ""}</span>${icons.chev}</li>`; }).join("")}</ul>`
-    : '<div class="empty"><p>У сховищі ще немає пісенників.</p></div>';
-  view.querySelectorAll("li[data-b]").forEach((li) => (li.onclick = () => (location.hash = "#/b/" + encodeURIComponent(li.dataset.b))));
+  let list;
+  try { list = await listBooks(); } catch (e) { return errorView(e, screenBooks); }
+  renderSide();
+  if (list.length === 1) { location.replace("#/b/" + encodeURIComponent(list[0].name)); return; }
+  if (!list.length) { view.innerHTML = '<div class="empty"><p>У сховищі ще немає пісенників.</p></div>'; return; }
+  const meta = store.get("bookMeta", {});
+  view.innerHTML = `
+    <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="qa" type="search" placeholder="Пошук у всіх пісенниках" autocomplete="off" value="${esc(state.allQ || "")}"></div>
+    <div id="allRes"></div>
+    <div id="bookList"><div class="section-title">Пісенники</div><ul class="list">${list.map((b) => { const m = meta[b.name] || {}; return `<li data-b="${esc(b.name)}"><span class="plan-icon">${icons.book}</span><span class="txt"><div class="t">${esc(m.title || b.name)}</div>${m.count ? `<div class="f">${m.count} пісень</div>` : ""}</span>${icons.chev}</li>`; }).join("")}</ul></div>`;
+  $("#bookList").onclick = (e) => { const li = e.target.closest("li[data-b]"); if (li) location.hash = "#/b/" + encodeURIComponent(li.dataset.b); };
+  let seq = 0;
+  const run = async () => {
+    const q = norm(($("#qa").value || "").trim());
+    state.allQ = $("#qa").value;
+    $("#bookList").classList.toggle("hidden", !!q);
+    if (!q) { $("#allRes").innerHTML = ""; return; }
+    const my = ++seq;
+    $("#allRes").innerHTML = '<div class="spinner"></div>';
+    const res = await searchAll(q);
+    if (my !== seq) return;
+    const shown = res.slice(0, 300);
+    $("#allRes").innerHTML = `<div class="count">Знайдено: ${res.length}</div><ul class="list">${shown.map((r) => songRow(r.name, r.s, r.n, r.title)).join("") || '<li class="muted">Нічого не знайдено</li>'}</ul>`;
+  };
+  $("#qa").oninput = run;
+  $("#allRes").onclick = (e) => { const li = e.target.closest("li[data-id]"); if (li) location.hash = `#/b/${encodeURIComponent(li.dataset.b)}/s/${li.dataset.id}`; };
+  if (state.allQ) run();
 }
 
-async function screenSongs(name) {
+async function screenSongs(name, activeId) {
   setTab("songs");
   try { await ensureBook(name); } catch (e) { setBar(name, "", { back: "#/" }); return errorView(e, () => screenSongs(name)); }
-  const books = store.get("books", []);
-  setBar(state.book.title || name, `${state.book.songs.length} пісень`, { back: books.length > 1 ? "#/" : null });
+  renderSide();
+  const many = store.get("books", []).length > 1;
+  setBar(state.book.title || name, `${state.book.songs.length} пісень`, { back: many && !isWide() ? "#/" : null });
   view.innerHTML = `
     <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="q" type="search" placeholder="Назва, рядок пісні або номер" value="${esc(state.filter)}" autocomplete="off"></div>
+    ${many ? `<label class="all-toggle"><input type="checkbox" id="allBooks" ${state.all ? "checked" : ""}><span>Шукати в усіх пісенниках</span></label>` : ""}
     <div class="count" id="count"></div>
     <ul class="list" id="songs"></ul>
     ${cfg().readOnly ? "" : `<button class="fab" id="fab" aria-label="Нова пісня">${icons.plus}Пісня</button>`}`;
-  const render = () => {
+  let seq = 0;
+  const render = async () => {
     const q = norm(state.filter.trim());
+    const cur = location.hash.match(/\/s\/([^/]+)/);
+    const act = cur ? cur[1] : activeId;
+    if (q && state.all && many) {
+      const my = ++seq;
+      $("#count").textContent = "Шукаю…";
+      const res = await searchAll(q);
+      if (my !== seq) return;
+      $("#count").textContent = `Знайдено в усіх пісенниках: ${res.length}`;
+      $("#songs").innerHTML = res.slice(0, 300).map((r) => songRow(r.name, r.s, r.n, r.title, r.s.id === act)).join("") || '<li class="muted">Нічого не знайдено</li>';
+      return;
+    }
+    seq++;
     let items = state.book.songs.map((s, i) => ({ s, n: i + 1 }));
-    if (q) items = items.filter(({ s, n }) => String(n) === q || norm(s.title).includes(q) || norm(s.altTitle).includes(q) || (s.chunks || []).some((c) => norm(c.text).includes(q)));
+    if (q) items = items.filter(({ s, n }) => matchSong(s, n, q));
     $("#count").textContent = q ? `Знайдено: ${items.length}` : "";
-    const shown = items.slice(0, 300);
-    $("#songs").innerHTML = shown.map(({ s, n }) => `<li data-id="${esc(s.id)}"><span class="n">${n}</span><span class="txt"><div class="t">${esc(s.title.trim() || "без назви")}</div><div class="f">${esc(firstLine(s))}</div></span></li>`).join("")
+    const shown = items.slice(0, q ? 300 : 1000);
+    $("#songs").innerHTML = shown.map(({ s, n }) => songRow(name, s, n, "", s.id === act)).join("")
       + (items.length > shown.length ? `<li class="muted small">… ще ${items.length - shown.length}. Уточніть пошук.</li>` : "")
       + (!items.length ? '<li class="muted">Нічого не знайдено</li>' : "");
   };
   render();
   $("#q").oninput = (e) => { state.filter = e.target.value; render(); };
+  if ($("#allBooks")) $("#allBooks").onchange = (e) => { state.all = e.target.checked; render(); };
   $("#songs").onclick = (e) => {
     const li = e.target.closest("li[data-id]");
     if (!li) return;
     state.scroll = scrollY;
-    location.hash = `#/b/${encodeURIComponent(name)}/s/${li.dataset.id}`;
+    location.hash = `#/b/${encodeURIComponent(li.dataset.b)}/s/${li.dataset.id}`;
   };
   if ($("#fab")) $("#fab").onclick = () => (location.hash = `#/b/${encodeURIComponent(name)}/new`);
-  requestAnimationFrame(() => scrollTo(0, state.scroll));
+  if (!isWide()) requestAnimationFrame(() => scrollTo(0, state.scroll));
 }
 
 function screenSong(name, id) {
@@ -344,7 +426,7 @@ function screenSong(name, id) {
   const authors = [s.wordsAuthor && "сл. " + s.wordsAuthor, s.musicAuthor && "муз. " + s.musicAuthor].filter(Boolean).join(" · ");
   view.innerHTML = `<article class="song"><h1>${esc(s.title)}</h1><div class="meta">${esc([s.altTitle, authors].filter(Boolean).join(" · "))}</div>
     ${(s.chunks || []).map((c) => `<div class="part" style="border-color:${colorOf(c.name)}"><div class="part-name" style="color:${colorOf(c.name)}">${esc(c.name)}</div><div class="part-text">${esc(lines(c.text))}</div></div>`).join("")}</article>`;
-  scrollTo(0, 0);
+  toTop();
   const zoom = (d) => { const v = Math.min(34, Math.max(14, store.get("lyrics", 19) + d)); store.set("lyrics", v); document.documentElement.style.setProperty("--lyrics", v + "px"); };
   $("#zm").onclick = () => zoom(-2);
   $("#zp").onclick = () => zoom(2);
@@ -395,7 +477,7 @@ function screenEdit(name, id) {
   const grow = (t) => { t.style.height = "auto"; t.style.height = t.scrollHeight + 2 + "px"; };
   const dirty = () => { editing.dirty = true; };
   render();
-  scrollTo(0, 0);
+  toTop();
   view.oninput = (e) => {
     const t = e.target;
     const map = { fT: "title", fA: "altTitle", fW: "wordsAuthor", fM: "musicAuthor" };
@@ -434,7 +516,7 @@ function screenEdit(name, id) {
     try {
       const saved = await saveSong(name, out, editing.base);
       editing = null;
-      state.book = null; // reload with the saved song
+      dropBook(name); delete root.dataset.book; // reload with the saved song
       await ensureBook(name);
       toast("Збережено. На комп'ютерах пісня з'явиться після синхронізації.", "ok");
       document.body.classList.remove("editing");
@@ -448,7 +530,7 @@ function screenEdit(name, id) {
     if (!(await ask("Видалити пісню?", `«${song.title}» буде видалено на всіх комп'ютерах.\nНомери наступних пісень зсунуться.`, "Видалити", true))) return;
     try {
       await saveSong(name, song, editing.base, true);
-      editing = null; state.book = null;
+      editing = null; dropBook(name); delete root.dataset.book;
       document.body.classList.remove("editing");
       toast("Пісню видалено", "ok");
       location.replace("#/b/" + encodeURIComponent(name));
@@ -518,7 +600,7 @@ async function openPlanSong(it) {
     <p class="hint">Повний текст є на комп'ютерах церкви: пісенник «${esc(it.getAttribute("TextModuleName") || "")}» не синхронізується з телефоном.</p>
     ${similar ? `<button class="btn full" id="sim">Схожа пісня є в «${esc(similar.book)}» — відкрити</button>` : ""}</article>`;
   if (similar) $("#sim").onclick = () => (location.hash = `#/b/${encodeURIComponent(similar.name)}/s/${similar.id}`);
-  scrollTo(0, 0);
+  toTop();
 }
 
 function screenSettings() {
@@ -546,7 +628,7 @@ function screenSettings() {
     try {
       const info = await gh("");
       store.set("readOnly", !(info.permissions && info.permissions.push));
-      state.book = null; state.name = "";
+      dropBook(""); state.name = ""; delete root.dataset.book;
       toast("Підключено", "ok");
       location.hash = "#/";
     } catch (err) {
@@ -559,12 +641,49 @@ function screenSettings() {
     if (!(await ask("Вийти?", "Токен буде видалено з цього телефону. Збережені пісні теж.", "Вийти", true))) return;
     store.set("token", ""); store.set("books", []); store.set("readOnly", false);
     try { await caches.delete("vs-data"); } catch (_) {}
-    state.book = null; state.name = "";
+    dropBook(""); state.name = ""; delete root.dataset.book;
     screenSettings();
   };
 }
 
 /* ---------------------------------------------------------------- router */
+
+/* ---------------------------------------------------------------- layout */
+
+// single: one screen in the whole content area (phones, and plan/settings everywhere)
+function single() {
+  if (root.dataset.layout !== "single") { root.innerHTML = ""; root.dataset.layout = "single"; delete root.dataset.book; }
+  view = root;
+  view.oninput = view.onclick = null;
+}
+// split (wide screens): the song list on the left, the song on the right
+async function split(name, id) {
+  if (root.dataset.layout !== "split") {
+    root.innerHTML = '<div class="split"><section class="pane list-pane" id="listPane"></section><section class="pane detail-pane" id="detailPane"></section></div>';
+    root.dataset.layout = "split";
+    delete root.dataset.book;
+  }
+  const lp = $("#listPane");
+  const showingAll = state.all && state.filter.trim();
+  if (root.dataset.book !== name && !(showingAll && root.dataset.book)) {
+    view = lp;
+    lp.oninput = lp.onclick = null;
+    await screenSongs(name, id);
+    root.dataset.book = name;
+  } else {
+    lp.querySelectorAll("li[data-id]").forEach((li) => li.classList.toggle("active", li.dataset.id === id));
+  }
+  const act = lp.querySelector("li.active");
+  if (act) act.scrollIntoView({ block: "nearest" });
+  view = $("#detailPane");
+  view.oninput = view.onclick = null;
+}
+function pickSong(name) {
+  setBar(state.book.title || name, `${state.book.songs.length} пісень`);
+  view.innerHTML = `<div class="empty pick">${icons.music}<p>Виберіть пісню зі списку ліворуч${cfg().readOnly ? "" : " або створіть нову"}.</p></div>`;
+}
+wideMQ.addEventListener("change", () => { document.body.classList.toggle("wide", isWide()); delete root.dataset.layout; route(); });
+document.body.classList.toggle("wide", isWide());
 
 async function route() {
   const h = location.hash.replace(/^#/, "") || "/";
@@ -572,6 +691,20 @@ async function route() {
   if (!cfg().token && h !== "/settings") { location.replace("#/settings"); return; }
   let m;
   try {
+    const book = h.match(/^\/b\/([^/]+)(?:\/(s)\/([^/]+))?(?:\/(edit|new))?$/) || h.match(/^\/b\/([^/]+)\/(new)$/);
+    if (book && isWide()) {
+      const n = decodeURIComponent(book[1]);
+      const id = book[2] === "s" ? book[3] : null;
+      await ensureBook(n);
+      await split(n, id);
+      renderSide();
+      if (h.endsWith("/new")) return screenEdit(n, null);
+      if (h.endsWith("/edit")) return screenEdit(n, id);
+      if (id) return screenSong(n, id);
+      return pickSong(n);
+    }
+    single();
+    renderSide();
     if (h === "/settings") return screenSettings();
     if (h === "/plan") return await screenPlan();
     if ((m = h.match(/^\/plan\/s\/(\d+)$/))) {
